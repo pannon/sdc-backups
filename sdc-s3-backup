@@ -24,70 +24,54 @@
 # IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 #------------------------------------------------------------------------+
-#
-# Simple script to backup all or selected zones.
-# Each zone is recursively snapshoted and sent
-# to an SSH gateway zone where it expects to
-# upload the snapshot to an S3 compatible object
-# store via s3cmd.
-#
-# Additionally the headnode config is backed up.
-#
-# Requires: SmartOS, s3cmd, SSH pubkey auth, SSH
-#
-# Assumptions:
-#   - needs to run on headnode
-#   - SSH pubkey authentication
-#   - s3cmd is configured to access the bucket
-#   - SSH zone/box with s3 access
-#
-#   [headnode]
-#       |
-#     (ssh)
-#       |
-#   [SSH zone]
-#       |
-#     (s3)
-#       |
-#  [s3 storage]
-#    (LeoFS)
-#------------------------------------------------
 
 PATH='/bin:/usr/sbin:/usr/bin:/sbin'
 
 # Source config
-. /zones/scripts/sdc-backup.conf
+. /opt/custom/etc/sdc-s3-backup.conf
 
 snapshot="backup"
-config="/usbkey/config"
+sdc_usb_config="/usbkey/config"
 arglen="$(echo $1 | wc -c)"
-is_manatee='false'
 
 __help () {
 cat << 'EOT'
 
-Usage: $0 [ UUID | all | -f filename | help | -h ]"
+Usage: sdc-s3-backup [ UUID | all | -f filename | help | -h ]
 
 Description:
-  - keyword \"all\" backs-up all zones
-  - UUID will backup a single zone
-  - "-f filename" where file has one UUID/line
 
- Simple script to backup all or selected zones.
- Each zone is recursively snapshoted and sent
- to an SSH gateway zone where it expects to
- upload the snapshot to an S3 compatible object
- store via s3cmd.
+  Simple script to backup all or selected zones.
+  Each zone is recursively snapshoted and sent
+  to an SSH gateway zone where it expects to
+  upload the snapshot to an S3 compatible object
+  store via s3cmd.
 
- Additionally the headnode config is backed up.
+  Additionally the headnode config is backed up.
 
- Requires: SmartOS, s3cmd, SSH pubkey auth, SSH
+Options:
 
- Assumptions:
-   - needs to run on headnode
-   - SSH pubkey authentication
-   - s3cmd is configured to access the bucket
-   - SSH zone/box with s3 access
+  UUID   backup a single zone identified by UUID
+  all    backup all zones on this headnode
+  -f     backup zones listed in file (one UUID per line)
+  -h     display this help
+  help   same as -h
+
+Requires:
+
+  - SmartOS
+  - SSH zone with s3cmd (installed/configured)
+  - SSH pubkey auth from headnode to SSH zone
+  - s3cmd 1.5.x or higher (pip install s3cmd)
+  - configuration file /opt/custom/etc/sdc-s3-backup.conf
+
+Assumptions:
+
+  - this script is installed in /opt/custom/bin/sdc-s3-backup
+  - needs to run on headnode
+  - SSH pubkey authentication from headnode to SSH zone
+  - s3cmd is configured to access the bucket
+  - SSH zone/box with s3 access
 
    [headnode]
        |
@@ -103,35 +87,22 @@ Description:
 EOT
 }
 
-__is_manatee () {
-    _uuid="$1"
-
-    for _line in "$(vmadm list -Ho uuid,alias)" ; do
-        _alias=$(echo "$_line" | grep $_uuid | grep manatee)
-
-        if [ ! -z $_alias ] ; then
-            export is_manatee=true
-        fi
-    done
-
-}
-
+# Snapshot the zone and zfs send to the SSH zone where the image
+# is uploaded with s3cmd inline to s3 object store.
+# Expects one argument: zone UUID
 __snap_and_send () {
     _zone="$1"
     _size="$(zfs get -Ho value used zones/${_zone})"
 
-    # check for manatee zone
-    __is_manatee $_zone
-
-    if [ "$is_manatee" == 'true' ] ; then
-        _zone=$_zone/data/manatee
-    fi
-
     echo "Processing: ${_zone}.zfs"
     echo "      Size: ${_size}"
     zfs snapshot -r zones/${_zone}@${snapshot}
-    zfs send -vR zones/${_zone}@${snapshot} | gzip | ssh ${user}@${host} \
-    "s3cmd --no-check-md5 --force --no-encrypt --multipart-chunk-size-mb=50 put - s3://${bucket}/${_zone}.zfs"
+
+    zfs send -vR zones/${_zone}@${snapshot} | \
+    gzip | \
+    ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/${_zone}.zfs.gz"
+
     zfs destroy -r zones/${_zone}@${snapshot}
 }
 
@@ -143,7 +114,6 @@ __backup_all () {
             __snap_and_send $_zone
         fi
     done
-
 }
 
 __backup_list () {
@@ -168,6 +138,7 @@ __backup_list () {
 # a primitive UUID guess, backup a single zone by UUID
 if [ $arglen -eq "37" ] ; then
     __snap_and_send "$1"
+    exit
 fi
 
 while [ $# ] ; do
@@ -189,5 +160,6 @@ while [ $# ] ; do
 done
 
 echo "Backing up SDC USB config.."
-cat ${config} | ssh ${user}@${host} "s3cmd put - s3://${bucket}/config"
-
+cat ${sdc_usb_config} | \
+ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+"s3cmd put - s3://${s3bucket}/config"
