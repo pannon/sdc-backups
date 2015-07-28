@@ -135,6 +135,13 @@ __backup_list () {
     fi
 }
 
+__backup_usb_config () {
+    echo "Backing up SDC USB config.."
+    cat ${sdc_usb_config} | \
+    ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+    "s3cmd put - s3://${s3bucket}/config"
+}
+
 # a primitive UUID guess, backup a single zone by UUID
 if [ $arglen -eq "37" ] ; then
     __snap_and_send "$1"
@@ -146,10 +153,10 @@ while [ $# ] ; do
         help|-h)    __help
                     exit
             ;;
-        all)        __backup_all
+        all)        __backup_all && __backup_usb_config
                     exit
             ;;
-        -f)         __backup_list "$2"
+        -f)         __backup_list "$2" && __backup_usb_config
                     exit
             ;;
         *)          __help
@@ -158,8 +165,3 @@ while [ $# ] ; do
     esac
     shift
 done
-
-echo "Backing up SDC USB config.."
-cat ${sdc_usb_config} | \
-ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-"s3cmd put - s3://${s3bucket}/config"
