@@ -104,6 +104,7 @@ __snap_and_send () {
     "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/${_zone}.zfs.gz"
 
     zfs destroy -r zones/${_zone}@${snapshot}
+    __fetch_origin ${_zone}
 }
 
 __backup_all () {
@@ -132,6 +133,16 @@ __backup_list () {
         done
     else
         echo "Error: file $_list not found"
+    fi
+}
+
+__fetch_origin () {
+    _dataset="$1"
+    _origin="$(zfs get -Ho value origin zones/$1)"
+
+    if [ $_origin != '-' ] ; then
+        _zone=$(echo $_origin | cut -f 2 -d/ | cut -f 1 -d @)
+        __snap_and_send $_zone
     fi
 }
 
