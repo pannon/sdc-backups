@@ -1,6 +1,6 @@
 ```
 
-Usage: sdc-s3-backup [ UUID | all | -f filename | help | -h ]
+Usage: sdc-s3-backup [ global | UUID | all | -f filename | usb | help | -h ]
 
 Description:
 
@@ -14,11 +14,13 @@ Description:
 
 Options:
 
-  UUID   backup a single zone identified by UUID
-  all    backup all zones on this headnode
-  -f     backup zones listed in file (one UUID per line)
-  -h     display this help
-  help   same as -h
+  global   backup global zone bits (/opt /var /etc/zones)
+  UUID     backup a single zone identified by UUID
+  all      backup everything (global, non-global and usb config)
+  -f       backup zones listed in file (one UUID per line)
+  usb      backup usb config file
+  json     backup zone_uuid.json configuration
+  help|-h  display this help
 
 Requires:
 
