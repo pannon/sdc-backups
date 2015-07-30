@@ -27,8 +27,10 @@
 
 PATH='/bin:/usr/sbin:/usr/bin:/sbin'
 
-# Source config
-. /opt/custom/etc/sdc-s3-backup.conf
+# If we are on SmartOS source the config file
+if [ $(uname) == 'SunOS' ] ; then
+    . /opt/custom/etc/sdc-s3-backup.conf
+fi
 
 snapshot="backup"
 sdc_usb_config="/usbkey/config"
@@ -37,7 +39,7 @@ arglen="$(echo $1 | wc -c)"
 __help () {
 cat << 'EOT'
 
-Usage: sdc-s3-backup [ UUID | all | -f filename | help | -h ]
+Usage: sdc-s3-backup [ global | UUID | all | -f filename | usb | help | -h ]
 
 Description:
 
@@ -51,11 +53,13 @@ Description:
 
 Options:
 
-  UUID   backup a single zone identified by UUID
-  all    backup all zones on this headnode
-  -f     backup zones listed in file (one UUID per line)
-  -h     display this help
-  help   same as -h
+  global   backup global zone bits (/opt /var /etc/zones)
+  UUID     backup a single zone identified by UUID
+  all      backup everything (global, non-global and usb config)
+  -f       backup zones listed in file (one UUID per line)
+  usb      backup usb config file
+  json     backup zone_uuid.json configuration
+  help|-h  display this help
 
 Requires:
 
@@ -87,6 +91,43 @@ Assumptions:
 EOT
 }
 
+__backup_json () {
+    # save UUID.json configs - just in case we need these..
+    echo "INFO: backing up zone_uuid.json configuration files.."
+    for zone in $(vmadm list -Ho uuid) ; do
+        vmadm get $zone | ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+        "s3cmd put - s3://${s3bucket}/$zone.json"
+    done
+}
+
+# Backup bits required for successful headnode restore.
+#  * /etc/zones
+#  * /var (see excludes)
+#  * /opt
+#  * UUID.json for zones
+#------------------------------------------------------
+__backup_global_zone () {
+    echo "INFO: backing up global zone bits.."
+    # backup zone *.xml files
+    gtar -czf - /etc/zones | \
+    ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/globalzone/etc-zones.tgz"
+
+    # backup /var excluding tmp and crash
+    gtar --exclude='var/tmp' \
+         --exclude='var/crash' \
+         --exclude='var/log' -czf - /var | \
+    ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/globalzone/var.tgz"
+
+    # backup /opt
+    zfs snapshot zones/opt@${snapshot}
+    zfs send -v zones/opt@${snapshot} | gzip -1 | \
+    ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/globalzone/opt.zfs.gz"
+    zfs destroy zones/opt@${snapshot}
+}
+
 # Snapshot the zone and zfs send to the SSH zone where the image
 # is uploaded with s3cmd inline to s3 object store.
 # Expects one argument: zone UUID
@@ -96,10 +137,10 @@ __snap_and_send () {
 
     echo "Processing: ${_zone}.zfs"
     echo "      Size: ${_size}"
+
     zfs snapshot -r zones/${_zone}@${snapshot}
 
-    zfs send -vR zones/${_zone}@${snapshot} | \
-    gzip | \
+    zfs send -vR zones/${_zone}@${snapshot} | gzip -1 | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
     "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/${_zone}.zfs.gz"
 
@@ -107,9 +148,11 @@ __snap_and_send () {
     __fetch_origin ${_zone}
 }
 
+# backup all zones
 __backup_all () {
     _zones="$(vmadm list -Ho uuid)"
 
+    echo "INFO: backing up all zones.."
     for _zone in $_zones ; do
         if [ ! -z $_zone ] ; then
             __snap_and_send $_zone
@@ -117,6 +160,7 @@ __backup_all () {
     done
 }
 
+# backup zones listed in file, one UUID per line
 __backup_list () {
     _list="$1"
 
@@ -128,6 +172,8 @@ __backup_list () {
             # check if line looks like UUID
             if [ $_uuidlen -eq "37" ] ; then
                 __snap_and_send $_zone
+                vmadm get $_zone | ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+                "s3cmd put - s3://${s3bucket}/${_zone}.json"
             fi
 
         done
@@ -136,26 +182,32 @@ __backup_list () {
     fi
 }
 
+# This is required for clones, look up origin ZFS datasets
+# and backup those as well (required for restoring cloned zones)
 __fetch_origin () {
     _dataset="$1"
     _origin="$(zfs get -Ho value origin zones/$1)"
 
     if [ $_origin != '-' ] ; then
         _zone=$(echo $_origin | cut -f 2 -d/ | cut -f 1 -d @)
+        echo "INFO: backing up origin dataset.."
         __snap_and_send $_zone
     fi
 }
 
+# Take a copy of the current USB configuration
 __backup_usb_config () {
     echo "Backing up SDC USB config.."
     cat ${sdc_usb_config} | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "s3cmd put - s3://${s3bucket}/config"
+    "s3cmd put - s3://${s3bucket}/globalzone/usbkey/config"
 }
 
 # a primitive UUID guess, backup a single zone by UUID
 if [ $arglen -eq "37" ] ; then
     __snap_and_send "$1"
+    vmadm get $1 | ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
+    "s3cmd put - s3://${s3bucket}/$1.json"
     exit
 fi
 
@@ -164,10 +216,22 @@ while [ $# ] ; do
         help|-h)    __help
                     exit
             ;;
-        all)        __backup_all && __backup_usb_config
+        usb)        __backup_usb_config
                     exit
             ;;
-        -f)         __backup_list "$2" && __backup_usb_config
+        global)     __backup_global_zone && __backup_usb_config && \
+                    __backup_json
+                    exit
+            ;;
+        all)        __backup_all && __backup_global_zone && \
+                    __backup_usb_config && __backup_json
+                    exit
+            ;;
+        json)       __backup_json
+                    exit
+            ;;
+        -f)         __backup_list "$2" && __backup_global_zone && \
+                    __backup_usb_config && __backup_json
                     exit
             ;;
         *)          __help
