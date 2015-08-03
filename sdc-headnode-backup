@@ -25,29 +25,30 @@
 # POSSIBILITY OF SUCH DAMAGE.
 #------------------------------------------------------------------------+
 
-PATH='/bin:/usr/sbin:/usr/bin:/sbin'
+PATH='/bin:/usr/sbin:/usr/bin:/sbin:/opt/local/bin/'
 
 # If we are on SmartOS source the config file
 if [ $(uname) == 'SunOS' ] ; then
-    . /opt/custom/etc/sdc-s3-backup.conf
+    . /opt/custom/etc/sdc-headnode-backup.conf
 fi
 
 snapshot="backup"
 sdc_usb_config="/usbkey/config"
-arglen="$(echo $1 | wc -c)"
+arglen="$1"
+upload_cmd=""
 
 __help () {
 cat << 'EOT'
 
-Usage: sdc-s3-backup [ global | UUID | all | -f filename | usb | help | -h ]
+Usage: sdc-headnode-backup [ global | UUID | all | -f filename | usb | help | -h ]
 
 Description:
 
   Simple script to backup all or selected zones.
   Each zone is recursively snapshoted and sent
   to an SSH gateway zone where it expects to
-  upload the snapshot to an S3 compatible object
-  store via s3cmd.
+  upload the snapshot to Manta (with mput) or an
+  S3 compatible object store via s3cmd.
 
   Additionally the headnode config is backed up.
 
@@ -66,26 +67,28 @@ Requires:
   - SmartOS
   - SSH zone with s3cmd (installed/configured)
   - SSH pubkey auth from headnode to SSH zone
+  - mput (npm install -g manta)
   - s3cmd 1.5.x or higher (pip install s3cmd)
-  - configuration file /opt/custom/etc/sdc-s3-backup.conf
+  - configuration file /opt/custom/etc/sdc-headnode-backup.conf
 
 Assumptions:
 
-  - this script is installed in /opt/custom/bin/sdc-s3-backup
+  - this script is installed in /opt/custom/bin/sdc-headnode-backup
   - needs to run on headnode
   - SSH pubkey authentication from headnode to SSH zone
-  - s3cmd is configured to access the bucket
-  - SSH zone/box with s3 access
+  - mput flags are configured in sdc-headnode-backup.conf
+  - s3cmd is configured to access the bucket (sdc-headnode-backup.conf)
+  - SSH zone/box with Manta or s3 access
 
-   [headnode]
-       |
-     (ssh)
-       |
-   [SSH zone]
-       |
-     (s3)
-       |
-  [s3 storage]
+         [headnode]
+             |
+           (ssh)
+             |
+         [SSH zone]
+          /     \
+      (s3cmd)  (mput)
+        /         \
+ [s3 storage]  [Manta storage]
     (LeoFS)
 
 EOT
@@ -96,7 +99,7 @@ __backup_json () {
     echo "INFO: backing up zone_uuid.json configuration files.."
     for zone in $(vmadm list -Ho uuid) ; do
         vmadm get $zone | ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-        "s3cmd put - s3://${s3bucket}/$zone.json"
+        "${upload_cmd}/$zone.json"
     done
 }
 
@@ -111,25 +114,25 @@ __backup_global_zone () {
     # backup zone *.xml files
     gtar -czf - /etc/zones | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/globalzone/etc-zones.tgz"
+    "${upload_cmd}/globalzone/etc-zones.tgz"
 
     # backup /var excluding tmp and crash
     gtar --exclude='var/tmp' \
          --exclude='var/crash' \
          --exclude='var/log' -czf - /var | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/globalzone/var.tgz"
+    "${upload_cmd}/globalzone/var.tgz"
 
     # backup /opt
     zfs snapshot zones/opt@${snapshot}
     zfs send -v zones/opt@${snapshot} | gzip -1 | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/globalzone/opt.zfs.gz"
+    "${upload_cmd}/globalzone/opt.zfs.gz"
     zfs destroy zones/opt@${snapshot}
 }
 
 # Snapshot the zone and zfs send to the SSH zone where the image
-# is uploaded with s3cmd inline to s3 object store.
+# is uploaded with inline with mput or s3cmd an object store.
 # Expects one argument: zone UUID
 __snap_and_send () {
     _zone="$1"
@@ -142,7 +145,7 @@ __snap_and_send () {
 
     zfs send -vR zones/${_zone}@${snapshot} | gzip -1 | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "s3cmd ${s3cmd_flags} put - s3://${s3bucket}/${_zone}.zfs.gz"
+    "${upload_cmd}/${_zone}.zfs.gz"
 
     zfs destroy -r zones/${_zone}@${snapshot}
     __fetch_origin ${_zone}
@@ -167,13 +170,11 @@ __backup_list () {
     if [ ! -z $_list ] && [ -e $_list ] ; then
         for _zone in $(cat $_list) ; do
 
-            _uuidlen="$(echo $_zone | wc -c)"
-
             # check if line looks like UUID
-            if [ $_uuidlen -eq "37" ] ; then
+            if [ ${#_zone} -eq "36" ] ; then
                 __snap_and_send $_zone
                 vmadm get $_zone | ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-                "s3cmd put - s3://${s3bucket}/${_zone}.json"
+                "${upload_cmd}/${_zone}.json"
             fi
 
         done
@@ -200,14 +201,23 @@ __backup_usb_config () {
     echo "Backing up SDC USB config.."
     cat ${sdc_usb_config} | \
     ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "s3cmd put - s3://${s3bucket}/globalzone/usbkey/config"
+    "${upload_cmd}/globalzone/usbkey/config"
 }
 
+# Check whether to use s3cmd or Manta
+if [ $use_s3 -eq 1 ] ; then
+    export upload_cmd="s3cmd put $s3cmd_flags - s3://$s3bucket"
+elif [ $use_manta -eq 1 ] ; then
+    export upload_cmd="mput $mput_flags $mput_destination"
+else
+    echo "Error: both Manta and s3 is disabled"
+fi
+
 # a primitive UUID guess, backup a single zone by UUID
-if [ $arglen -eq "37" ] ; then
+if [ ${#arglen} -eq "36" ] ; then
     __snap_and_send "$1"
     vmadm get $1 | ssh -i ${ssh_key} ${ssh_user}@${ssh_host} \
-    "s3cmd put - s3://${s3bucket}/$1.json"
+    "${upload_cmd}/$1.json"
     exit
 fi
 
